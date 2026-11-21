@@ -26,8 +26,9 @@ class HabitSerializer(serializers.ModelSerializer):
             "duration",
             "is_public",
             "created_at",
+            "last_reminder",
         )
-        read_only_fields = ("owner", "created_at")
+        read_only_fields = ("owner", "created_at", "last_reminder")
         validators = [
             RewardOrRelatedHabitValidator(),
             PleasantHabitValidator(),

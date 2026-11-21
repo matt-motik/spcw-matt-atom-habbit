@@ -1,16 +1,21 @@
-"""Тесты приложения habits: модель, валидаторы, эндпоинты, права доступа и пагинация."""
+"""Тесты приложения habits: модель, валидаторы, эндпоинты, права доступа, пагинация и напоминания."""
 
-from datetime import time
+from datetime import date, datetime, time
 from typing import Any
+from unittest import mock
 
+import requests
 from django.core.exceptions import ValidationError
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIRequestFactory, APITestCase
 
 from habits.models import Habit
 from habits.serializers import HabitSerializer
+from habits.services import build_reminder, get_habits_to_remind, send_telegram_message
+from habits.tasks import send_habit_reminders
 from habits.validators import validate_duration, validate_periodicity
 from users.models import CustomUser
 
@@ -72,7 +77,7 @@ class HabitModelTestCase(HabitsTestCase):
 
     def test_str(self) -> None:
         """Привычка выводится в формате из книги."""
-        self.assertEqual(str(self.useful), "Я буду гулять вокруг квартала в 20:00 в на улице")
+        self.assertEqual(str(self.useful), "Я буду гулять вокруг квартала в 20:00 на улице")
 
     def test_defaults(self) -> None:
         """По умолчанию привычка ежедневная, полезная и не публичная."""
@@ -293,3 +298,111 @@ class PaginationTestCase(HabitsTestCase):
 
         data = self.client.get(reverse("habits:habits-list"), {"limit": 100}).json()
         self.assertEqual(len(data["results"]), 12)
+
+
+def moscow(hour: int, minute: int = 0, day: int = 10) -> datetime:
+    """Момент времени 2026-11-{day} в часовом поясе проекта."""
+    moment: datetime = timezone.make_aware(datetime(2026, 11, day, hour, minute))
+    return moment
+
+
+class HabitsToRemindTestCase(HabitsTestCase):
+    """Выбор привычек для напоминания."""
+
+    def test_time_has_come(self) -> None:
+        """Напоминание приходит, когда наступило время полезной привычки; приятные не напоминаются."""
+        self.assertEqual(get_habits_to_remind(moscow(19, 59)), [])
+        self.assertEqual(get_habits_to_remind(moscow(21, 30)), [self.useful])
+
+    def test_without_chat_id(self) -> None:
+        """Пользователю без chat_id напоминания не отправляются."""
+        self.user.tg_chat_id = ""
+        self.user.save()
+
+        self.assertEqual(get_habits_to_remind(moscow(21)), [])
+
+    def test_periodicity(self) -> None:
+        """Повторное напоминание приходит не раньше, чем через periodicity дней."""
+        self.useful.periodicity = 3
+        self.useful.last_reminder = date(2026, 11, 10)
+        self.useful.save()
+
+        for day, expected in ((10, []), (11, []), (12, []), (13, [self.useful])):
+            with self.subTest(day=day):
+                self.assertEqual(get_habits_to_remind(moscow(20, day=day)), expected)
+
+
+class BuildReminderTestCase(HabitsTestCase):
+    """Текст напоминания."""
+
+    def test_with_related_habit(self) -> None:
+        """В напоминании есть привычка, время на выполнение и приятная привычка."""
+        text = build_reminder(self.useful)
+
+        self.assertIn("Напоминание: я буду гулять вокруг квартала в 20:00 на улице.", text)
+        self.assertIn("120 сек", text)
+        self.assertIn("принять ванну с пеной", text)
+
+    def test_with_reward(self) -> None:
+        """Если связанной привычки нет, в напоминании указано вознаграждение."""
+        self.useful.related_habit = None
+        self.useful.reward = "чашка кофе"
+
+        self.assertIn("Награда: чашка кофе", build_reminder(self.useful))
+
+
+@override_settings(TELEGRAM_BOT_TOKEN="test-token", TELEGRAM_API_URL="https://api.telegram.test")
+class SendTelegramMessageTestCase(SimpleTestCase):
+    """Отправка сообщения в Telegram."""
+
+    @mock.patch("habits.services.requests.post")
+    def test_send(self, post: mock.Mock) -> None:
+        """Сообщение уходит методом sendMessage с chat_id и текстом."""
+        self.assertTrue(send_telegram_message("123456", "Привет"))
+
+        post.assert_called_once_with(
+            "https://api.telegram.test/bottest-token/sendMessage",
+            json={"chat_id": "123456", "text": "Привет"},
+            timeout=10,
+        )
+
+    @mock.patch("habits.services.requests.post")
+    def test_telegram_error(self, post: mock.Mock) -> None:
+        """Ошибка Telegram не роняет отправку, а возвращает False и пишется в лог без токена."""
+        post.return_value.raise_for_status.side_effect = requests.HTTPError("403 for url with test-token")
+
+        with self.assertLogs("habits.services", level="ERROR") as logs:
+            self.assertFalse(send_telegram_message("123456", "Привет"))
+        self.assertNotIn("test-token", logs.output[0])
+
+    @override_settings(TELEGRAM_BOT_TOKEN="")
+    @mock.patch("habits.services.requests.post")
+    def test_without_token(self, post: mock.Mock) -> None:
+        """Без токена бота запрос в Telegram не отправляется."""
+        with self.assertLogs("habits.services", level="WARNING"):
+            self.assertFalse(send_telegram_message("123456", "Привет"))
+        post.assert_not_called()
+
+
+class SendHabitRemindersTaskTestCase(HabitsTestCase):
+    """Задача Celery для рассылки напоминаний."""
+
+    @mock.patch("habits.tasks.timezone.localtime", return_value=moscow(20, 1))
+    @mock.patch("habits.tasks.send_telegram_message", return_value=True)
+    def test_sends_and_marks(self, send: mock.Mock, localtime: mock.Mock) -> None:
+        """Задача отправляет напоминание владельцу и запоминает дату, второй запуск в тот же день ничего не шлёт."""
+        self.assertEqual(send_habit_reminders(), 1)
+        send.assert_called_once_with("123456", build_reminder(self.useful))
+        self.useful.refresh_from_db()
+        self.assertEqual(self.useful.last_reminder, date(2026, 11, 10))
+
+        self.assertEqual(send_habit_reminders(), 0)
+        send.assert_called_once()
+
+    @mock.patch("habits.tasks.timezone.localtime", return_value=moscow(20, 1))
+    @mock.patch("habits.tasks.send_telegram_message", return_value=False)
+    def test_failed_send_retries(self, send: mock.Mock, localtime: mock.Mock) -> None:
+        """Если отправка не удалась, дата не запоминается и напоминание повторится при следующем запуске."""
+        self.assertEqual(send_habit_reminders(), 0)
+        self.useful.refresh_from_db()
+        self.assertIsNone(self.useful.last_reminder)

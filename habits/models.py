@@ -7,7 +7,7 @@ from habits.validators import validate_duration, validate_periodicity
 
 
 class Habit(models.Model):
-    """Привычка: я буду [действие] в [время] в [место]."""
+    """Привычка: я буду [действие] в [время] [место]. Место пишется с предлогом: «дома», «в парке»."""
 
     owner = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -15,9 +15,18 @@ class Habit(models.Model):
         related_name="habits",
         verbose_name="Создатель",
     )
-    place = models.CharField(max_length=255, verbose_name="Место")
+    place = models.CharField(
+        max_length=255,
+        verbose_name="Место",
+        help_text="Где выполнять привычку, вместе с предлогом: «дома», «в парке», «на кухне».",
+    )
     time = models.TimeField(verbose_name="Время", help_text="Время, когда нужно выполнять привычку.")
-    action = models.CharField(max_length=255, verbose_name="Действие")
+    action = models.CharField(
+        max_length=255,
+        verbose_name="Действие",
+        help_text="Что делать, глаголом несовершенного вида, чтобы читалось после «я буду»: "
+        "«делать 10 приседаний», «читать одну страницу».",
+    )
     is_pleasant = models.BooleanField(
         default=False,
         verbose_name="Приятная привычка",
@@ -55,6 +64,13 @@ class Habit(models.Model):
         help_text="Публичные привычки видят все пользователи.",
     )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создана")
+    last_reminder = models.DateField(
+        null=True,
+        blank=True,
+        editable=False,
+        verbose_name="Последнее напоминание",
+        help_text="Дата, когда бот последний раз напоминал о привычке.",
+    )
 
     class Meta:
         """Мета-параметры модели Habit."""
@@ -65,4 +81,4 @@ class Habit(models.Model):
 
     def __str__(self) -> str:
         """Возвращает привычку в формате из книги."""
-        return f"Я буду {self.action} в {self.time:%H:%M} в {self.place}"
+        return f"Я буду {self.action} в {self.time:%H:%M} {self.place}"
