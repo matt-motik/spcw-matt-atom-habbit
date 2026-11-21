@@ -1,0 +1,22 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.6
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v2.4.1
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - django>=6.1
+          - django-environ
+          - djangorestframework
+          - celery
+          - requests
+          - types-requests
+        args: [ --config-file=pyproject.toml ]
+        exclude: ^.*/migrations/.*$
+        files: ^(habits|config|users)/
