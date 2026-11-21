@@ -1,10 +1,12 @@
-"""Тесты приложения habits: модель и валидаторы привычки."""
+"""Тесты приложения habits: модель, валидаторы, эндпоинты, права доступа и пагинация."""
 
 from datetime import time
 from typing import Any
 
 from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase
+from django.urls import reverse
+from rest_framework import status
 from rest_framework.test import APIRequestFactory, APITestCase
 
 from habits.models import Habit
@@ -161,3 +163,133 @@ class HabitValidatorsTestCase(HabitsTestCase):
     def test_unset_pleasant_when_not_linked(self) -> None:
         """Признак приятной снимается, если привычка ни к чему не привязана."""
         self.assertTrue(self.get_serializer({"is_pleasant": False}, self.other_pleasant).is_valid())
+
+
+class HabitCRUDTestCase(HabitsTestCase):
+    """CRUD своих привычек."""
+
+    def setUp(self) -> None:
+        """Авторизует первого пользователя."""
+        super().setUp()
+        self.client.force_authenticate(self.user)
+
+    def test_list_only_own(self) -> None:
+        """В списке только свои привычки."""
+        response = self.client.get(reverse("habits:habits-list"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ids = {habit["id"] for habit in response.json()["results"]}
+        self.assertEqual(ids, {self.pleasant.pk, self.useful.pk})
+
+    def test_create(self) -> None:
+        """Создателем привычки становится текущий пользователь, даже если передан другой."""
+        response = self.client.post(reverse("habits:habits-list"), self.habit_data(owner=self.other.pk))
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        habit = Habit.objects.get(pk=response.json()["id"])
+        self.assertEqual(habit.owner, self.user)
+        self.assertEqual(habit.periodicity, 1)
+
+    def test_create_invalid(self) -> None:
+        """Ошибки валидаторов возвращаются с кодом 400."""
+        response = self.client.post(reverse("habits:habits-list"), self.habit_data(duration=300))
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("duration", response.json())
+
+    def test_retrieve(self) -> None:
+        """Своя привычка доступна для просмотра."""
+        response = self.client.get(reverse("habits:habits-detail", args=[self.useful.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["related_habit"], self.pleasant.pk)
+
+    def test_update(self) -> None:
+        """Свою привычку можно изменить."""
+        response = self.client.patch(reverse("habits:habits-detail", args=[self.useful.pk]), {"place": "в парке"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.useful.refresh_from_db()
+        self.assertEqual(self.useful.place, "в парке")
+
+    def test_delete(self) -> None:
+        """Свою привычку можно удалить, связь у полезной при этом обнуляется."""
+        response = self.client.delete(reverse("habits:habits-detail", args=[self.pleasant.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Habit.objects.filter(pk=self.pleasant.pk).exists())
+        self.useful.refresh_from_db()
+        self.assertIsNone(self.useful.related_habit)
+
+    def test_other_habit_not_available(self) -> None:
+        """Чужая привычка не видна, не изменяется и не удаляется, даже публичная."""
+        self.other_pleasant.is_public = True
+        self.other_pleasant.save()
+        url = reverse("habits:habits-detail", args=[self.other_pleasant.pk])
+
+        self.assertEqual(self.client.get(url).status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self.client.patch(url, {"place": "дома"}).status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self.client.delete(url).status_code, status.HTTP_404_NOT_FOUND)
+        self.assertTrue(Habit.objects.filter(pk=self.other_pleasant.pk).exists())
+
+    def test_anonymous(self) -> None:
+        """Без авторизации привычки недоступны."""
+        self.client.force_authenticate(None)
+
+        self.assertEqual(self.client.get(reverse("habits:habits-list")).status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(self.client.get(reverse("habits:public")).status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class PublicHabitTestCase(HabitsTestCase):
+    """Список публичных привычек."""
+
+    def test_public_list(self) -> None:
+        """В списке публичные привычки всех пользователей, включая свои."""
+        Habit.objects.filter(pk__in=[self.useful.pk, self.other_pleasant.pk]).update(is_public=True)
+        self.client.force_authenticate(self.user)
+        response = self.client.get(reverse("habits:public"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ids = {habit["id"] for habit in response.json()["results"]}
+        self.assertEqual(ids, {self.useful.pk, self.other_pleasant.pk})
+
+    def test_public_read_only(self) -> None:
+        """Публичный список только для чтения."""
+        self.client.force_authenticate(self.user)
+        response = self.client.post(reverse("habits:public"), self.habit_data())
+
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
+class PaginationTestCase(HabitsTestCase):
+    """Пагинация: по 5 привычек, limit и offset."""
+
+    def setUp(self) -> None:
+        """Добавляет первому пользователю ещё 10 публичных привычек."""
+        super().setUp()
+        Habit.objects.bulk_create(
+            Habit(owner=self.user, action=f"привычка {i}", time=time(9, 0), place="дома", duration=30, is_public=True)
+            for i in range(10)
+        )
+        self.client.force_authenticate(self.user)
+
+    def test_default_limit(self) -> None:
+        """По умолчанию отдаётся 5 привычек, count — общее количество."""
+        for url in (reverse("habits:habits-list"), reverse("habits:public")):
+            with self.subTest(url=url):
+                data = self.client.get(url).json()
+                self.assertEqual(len(data["results"]), 5)
+                self.assertIsNotNone(data["next"])
+                self.assertIsNone(data["previous"])
+
+        self.assertEqual(self.client.get(reverse("habits:habits-list")).json()["count"], 12)
+        self.assertEqual(self.client.get(reverse("habits:public")).json()["count"], 10)
+
+    def test_limit_offset(self) -> None:
+        """Limit и offset сдвигают окно выборки, limit ограничен 50."""
+        data = self.client.get(reverse("habits:habits-list"), {"limit": 3, "offset": 10}).json()
+        self.assertEqual(len(data["results"]), 2)
+        self.assertIsNone(data["next"])
+
+        data = self.client.get(reverse("habits:habits-list"), {"limit": 100}).json()
+        self.assertEqual(len(data["results"]), 12)
